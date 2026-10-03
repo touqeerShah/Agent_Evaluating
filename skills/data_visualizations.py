@@ -1,35 +1,34 @@
-from openai import OpenAI
-import pandas as pd
-import json
-import duckdb
-from pydantic import BaseModel, Field
-from IPython.display import Markdown
-
-from helper import get_openai_api_key
-from skills.lookuo_sales_data import lookup_sales_data
-
-# initialize the OpenAI client
-
-import phoenix as px
 import os
+from openai import OpenAI
+from pydantic import BaseModel, Field
 from phoenix.otel import register
 from openinference.instrumentation.openai import OpenAIInstrumentor
-from openinference.semconv.trace import SpanAttributes
-from opentelemetry.trace import Status, StatusCode
-from openinference.instrumentation import TracerProvider
-from helper import get_openai_api_key, get_phoenix_endpoint
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
-# initialize the OpenAI client
-openai_api_key = get_openai_api_key()
-client = OpenAI(api_key=openai_api_key)
+from skills.lookuo_sales_data import lookup_sales_data
+
+MODEL = "qwen2.5:7b-instruct"
 PROJECT_NAME = "tracing-agent"
-tracer_provider = register(
-    project_name=PROJECT_NAME, endpoint=get_phoenix_endpoint() + "v1/traces"
+
+# Use a plain URL, without Markdown link formatting.
+client = OpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="ollama",
+    timeout=180.0,
 )
-MODEL = "gpt-4o-mini"
+
+os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = "http://localhost:6006"
+
+tracer_provider = register(
+    project_name=PROJECT_NAME,
+    endpoint="http://localhost:6006/v1/traces",
+    protocol="http/protobuf",
+    batch=False,
+    sampler=ALWAYS_ON,
+)
+
 OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
 tracer = tracer_provider.get_tracer(__name__)
-MODEL = "gpt-4o-mini"
 # prompt template for step 1 of tool 3
 CHART_CONFIGURATION_PROMPT = """
 Generate a chart configuration based on this data: {data}
@@ -53,47 +52,48 @@ class VisualizationConfig(BaseModel):
 
 # code for step 1 of tool 3
 @tracer.chain()
-def extract_chart_config(data: str, visualization_goal: str) -> dict:
-    """Generate chart visualization configuration
+def extract_chart_config(
+    data: str,
+    visualization_goal: str,
+) -> dict:
+    """Generate a validated chart configuration."""
 
-    Args:
-        data: String containing the data to visualize
-        visualization_goal: Description of what the visualization should show
-
-    Returns:
-        Dictionary containing line chart configuration
-    """
     formatted_prompt = CHART_CONFIGURATION_PROMPT.format(
-        data=data, visualization_goal=visualization_goal
+        data=data,
+        visualization_goal=visualization_goal,
     )
 
     response = client.beta.chat.completions.parse(
         model=MODEL,
-        messages=[{"role": "user", "content": formatted_prompt}],
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Generate a chart configuration as JSON. "
+                    "Use only column names present in the supplied data. "
+                    "Follow the requested chart type and axes."
+                ),
+            },
+            {"role": "user", "content": formatted_prompt},
+        ],
         response_format=VisualizationConfig,
     )
 
-    try:
-        # Extract axis and title info from response
-        content = response.choices[0].message.content
+    message = response.choices[0].message
 
-        # Return structured chart config
-        return {
-            "chart_type": content.chart_type,
-            "x_axis": content.x_axis,
-            "y_axis": content.y_axis,
-            "title": content.title,
-            "data": data,
-        }
-    except Exception:
-        return {
-            "chart_type": "line",
-            "x_axis": "date",
-            "y_axis": "value",
-            "title": visualization_goal,
-            "data": data,
-        }
+    if message.refusal:
+        raise ValueError(f"Chart configuration refused: {message.refusal}")
 
+    config = message.parsed
+
+    if config is None:
+        raise ValueError("The model did not return a chart configuration.")
+
+    return {
+        **config.model_dump(),
+        "data": data,
+    }
 
 # code for step 2 of tool 3
 @tracer.chain()
@@ -103,6 +103,7 @@ def create_chart(config: dict) -> str:
 
     response = client.chat.completions.create(
         model=MODEL,
+        temperature=0,
         messages=[{"role": "user", "content": formatted_prompt}],
     )
 

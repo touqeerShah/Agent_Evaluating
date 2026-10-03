@@ -1,29 +1,38 @@
-from openai import OpenAI
 import pandas as pd
-import json
 import duckdb
-from pydantic import BaseModel, Field
-from IPython.display import Markdown
-
-import phoenix as px
 import os
+from openai import OpenAI
 from phoenix.otel import register
 from openinference.instrumentation.openai import OpenAIInstrumentor
-from openinference.semconv.trace import SpanAttributes
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 from opentelemetry.trace import Status, StatusCode
-from openinference.instrumentation import TracerProvider
-from helper import get_openai_api_key, get_phoenix_endpoint
+# Local Phoenix server
+os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = "http://localhost:6006"
 
-# initialize the OpenAI client
-openai_api_key = get_openai_api_key()
-client = OpenAI(api_key=openai_api_key)
 PROJECT_NAME = "tracing-agent"
-tracer_provider = register(
-    project_name=PROJECT_NAME, endpoint=get_phoenix_endpoint() + "v1/traces"
+MODEL = "qwen2.5:7b-instruct"
+
+client = OpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="ollama",
+    timeout=300.0,
+    max_retries=0,
 )
-MODEL = "gpt-4o-mini"
+
+tracer_provider = register(
+    project_name=PROJECT_NAME,
+    endpoint=(
+        os.environ["PHOENIX_COLLECTOR_ENDPOINT"].rstrip("/")
+        + "/v1/traces"
+    ),
+    protocol="http/protobuf",
+    batch=False,
+    sampler=ALWAYS_ON,  # Record every trace during local development.
+)
+
 OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
 tracer = tracer_provider.get_tracer(__name__)
+
 # define the path to the transactional data
 TRANSACTION_DATA_FILE_PATH = "data/Store_Sales_Price_Elasticity_Promotions_Data.parquet"
 # prompt template for step 2 of tool 1
@@ -36,6 +45,11 @@ The table name is: {table_name}
 """
 
 
+def update_sql_gen_prompt(new_prompt):
+    global SQL_GENERATION_PROMPT
+    SQL_GENERATION_PROMPT = new_prompt
+
+
 # code for step 2 of tool 1
 def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
     """Generate an SQL query based on a prompt"""
@@ -45,6 +59,7 @@ def generate_sql_query(prompt: str, columns: list, table_name: str) -> str:
 
     response = client.chat.completions.create(
         model=MODEL,
+        temperature=0,
         messages=[{"role": "user", "content": formatted_prompt}],
     )
 
@@ -70,17 +85,17 @@ def lookup_sales_data(prompt: str) -> str:
         sql_query = sql_query.strip()
         sql_query = sql_query.replace("```sql", "").replace("```", "")
         with tracer.start_as_current_span(
-            "execute_sql_query", openinference_span_kind="chain"
+            "execute_sql_query",
+            openinference_span_kind="chain",
         ) as span:
             span.set_input(sql_query)
-            # step 3: execute the SQL query
-            result = duckdb.sql(sql_query).df()
-            span.set_output(value=str(result))
-            span.set_status(StatusCode.OK)
-        # step 3: execute the SQL query
-        result = duckdb.sql(sql_query).df()
 
-        return result.to_string()
+            result = duckdb.sql(sql_query).df()
+
+            span.set_output(value=result.to_string(index=False))
+            span.set_status(StatusCode.OK)
+
+        return result.to_string(index=False)
     except Exception as e:
         return f"Error accessing data: {str(e)}"
 
@@ -89,3 +104,13 @@ example_data = lookup_sales_data(
     "Show me all the sales for store 1320 on November 1st, 2021"
 )
 print(example_data)
+
+
+def get_sql_gen_prompt():
+    table_name = "sales"
+    df = pd.read_parquet(TRANSACTION_DATA_FILE_PATH)
+    columns = df.columns
+
+    return SQL_GENERATION_PROMPT.format(
+        prompt="question", columns=columns, table_name=table_name
+    )

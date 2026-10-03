@@ -1,44 +1,32 @@
-from openai import OpenAI
-import pandas as pd
 import json
-import duckdb
-from pydantic import BaseModel, Field
-from IPython.display import Markdown
+from opentelemetry.trace import StatusCode
 
-from helper import get_openai_api_key
-
-# initialize the OpenAI client
-import phoenix as px
-import os
-from phoenix.otel import register
-from openinference.instrumentation.openai import OpenAIInstrumentor
-from openinference.semconv.trace import SpanAttributes
-from opentelemetry.trace import Status, StatusCode
-from openinference.instrumentation import TracerProvider
-from helper import get_openai_api_key, get_phoenix_endpoint
-
-# initialize the OpenAI client
-openai_api_key = get_openai_api_key()
-client = OpenAI(api_key=openai_api_key)
-PROJECT_NAME = "tracing-agent"
-tracer_provider = register(
-    project_name=PROJECT_NAME, endpoint=get_phoenix_endpoint() + "v1/traces"
+from skills.lookuo_sales_data import (
+    lookup_sales_data,
+    client,
+    tracer,
+    tracer_provider,
+    MODEL,
 )
-MODEL = "gpt-4o-mini"
-OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
-tracer = tracer_provider.get_tracer(__name__)
-
-MODEL = "gpt-4o-mini"
-# Define tools/functions that can be called by the model
-import json
-
-from skills.data_Anaylysis import analyze_sales_data
+from skills.data_anaylysis import analyze_sales_data
 from skills.data_visualizations import generate_visualization
-from skills.lookuo_sales_data import lookup_sales_data
 
 SYSTEM_PROMPT = """
-You are a helpful assistant that can answer questions about the Store Sales Price Elasticity Promotions dataset.
-"""
+You answer questions about the Store Sales Price Elasticity
+Promotions dataset.
+
+Use lookup_sales_data to retrieve data before answering factual
+questions about sales.
+
+For analysis, call analyze_sales_data using the retrieved data.
+For visualizations, call generate_visualization using the retrieved
+data and the user's visualization goal.
+
+Do not invent sales figures or column names.
+If a tool fails, correct the request when possible or explain the failure.
+"""  # Define tools/functions that can be called by the model
+
+
 tools = [
     {
         "type": "function",
@@ -124,20 +112,27 @@ def handle_tool_calls(tool_calls, messages):
     return messages
 
 
-def run_agent(messages):
-    print("Running agent with messages:", messages)
+def run_agent(messages, max_iterations=100, return_details=False):
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
-    if not any(
-        isinstance(message, dict) and message.get("role") == "system"
-        for message in messages
-    ):
-        system_prompt = {"role": "system", "content": SYSTEM_PROMPT}
-        messages.append(system_prompt)
+    else:
+        messages = [dict(message) for message in messages]
 
-    while True:
-        # Router Span
-        print("Starting router call span")
+    # Put system instructions first.
+    system_messages = [
+        message for message in messages if message.get("role") == "system"
+    ]
+    conversation = [message for message in messages if message.get("role") != "system"]
+
+    messages = (
+        system_messages or [{"role": "system", "content": SYSTEM_PROMPT}]
+    ) + conversation
+
+    total_tool_calls = 0
+
+    for iteration in range(max_iterations):
+        print(f"Agent iteration {iteration + 1}")
+
         with tracer.start_as_current_span(
             "router_call",
             openinference_span_kind="chain",
@@ -146,22 +141,47 @@ def run_agent(messages):
 
             response = client.chat.completions.create(
                 model=MODEL,
+                temperature=0,
                 messages=messages,
                 tools=tools,
             )
-            messages.append(response.choices[0].message.model_dump())
-            tool_calls = response.choices[0].message.tool_calls
-            print("Received response with tool calls:", bool(tool_calls))
-            span.set_status(StatusCode.OK)
+
+            assistant = response.choices[0].message
+            tool_calls = assistant.tool_calls or []
+
+            assistant_message = {
+                "role": "assistant",
+                "content": assistant.content or "",
+            }
 
             if tool_calls:
-                print("Starting tool calls span")
-                messages = handle_tool_calls(tool_calls, messages)
-                span.set_output(value=tool_calls)
-            else:
-                print("No tool calls, returning final response")
-                span.set_output(value=response.choices[0].message.content)
-                return response.choices[0].message.content
+                assistant_message["tool_calls"] = [
+                    call.model_dump(exclude_none=True) for call in tool_calls
+                ]
+
+            messages.append(assistant_message)
+
+            span.set_output(value=assistant_message)
+            span.set_status(StatusCode.OK)
+
+        if not tool_calls:
+            answer = assistant.content or "No response could be generated."
+
+            if return_details:
+                return {
+                    "response": answer,
+                    "messages": messages,
+                    "model_calls": iteration + 1,
+                    "tool_calls": total_tool_calls,
+                    "path_length": iteration + 1 + total_tool_calls,
+                }
+
+            return answer
+
+        total_tool_calls += len(tool_calls)
+        messages = handle_tool_calls(tool_calls, messages)
+
+    raise RuntimeError(f"Agent reached the limit of {max_iterations} model calls.")
 
 
 def start_main_span(messages):
@@ -178,6 +198,9 @@ def start_main_span(messages):
         return ret
 
 
-result = start_main_span(
-    [{"role": "user", "content": "Which stores did the best in 2021?"}]
-)
+if __name__ == "__main__":
+    result = start_main_span(
+        [{"role": "user", "content": "Which stores did the best in 2021?"}]
+    )
+    print(result)
+    tracer_provider.force_flush()

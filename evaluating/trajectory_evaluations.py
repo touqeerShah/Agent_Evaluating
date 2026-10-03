@@ -1,22 +1,22 @@
+from phoenix.client import Client
 import warnings
 
 warnings.filterwarnings("ignore")
-import phoenix as px
-from phoenix.evals import OpenAIModel
-from phoenix.experiments import run_experiment, evaluate_experiment
-from phoenix.experiments.types import Example
-from phoenix.experiments.evaluators import create_evaluator
+from phoenix.client import Client
+from phoenix.client.experiments import (
+    run_experiment,
+    evaluate_experiment,
+    create_evaluator,
+)
 from phoenix.otel import register
 import pandas as pd
 from datetime import datetime
-import os
-import nest_asyncio
+# import nest_asyncio
 
-nest_asyncio.apply()
+# nest_asyncio.apply()
 from agents.agent import run_agent
-from helper import get_openai_api_key, get_phoenix_endpoint
 
-px_client = px.Client()
+px_client = Client(base_url="http://localhost:6006")
 convergence_questions = [
     "What was the average quantity sold per transaction?",
     "What is the mean number of items per sale?",
@@ -40,9 +40,9 @@ convergence_questions = [
 convergence_df = pd.DataFrame({"question": convergence_questions})
 
 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-dataset = px_client.upload_dataset(
+dataset = px_client.datasets.create_dataset(
     dataframe=convergence_df,
-    dataset_name=f"convergence_questions-{now}",
+    name=f"convergence_questions-{now}",
     input_keys=["question"],
 )
 
@@ -78,31 +78,65 @@ def format_message_steps(messages):
     return "\n".join(steps)
 
 
-def run_agent_and_track_path(example: Example) -> str:
-    messages = [{"role": "user", "content": example.input.get("question")}]
-    ret = run_agent(messages)
-    return {"path_length": len(ret), "messages": format_message_steps(ret)}
+def run_agent_and_track_path(input: dict) -> dict:
+    result = run_agent(
+        input["question"],
+        return_details=True,
+    )
+
+    return {
+        "response": result["response"],
+        "path_length": result["path_length"],
+        "model_calls": result["model_calls"],
+        "tool_calls": result["tool_calls"],
+        "messages": format_message_steps(result["messages"]),
+    }
 
 
 experiment = run_experiment(
-    dataset,
-    run_agent_and_track_path,
+    dataset=dataset,
+    task=run_agent_and_track_path,
     experiment_name="Convergence Eval",
-    experiment_description="Evaluating the convergence of the agent",
+    experiment_description="Comparing agent execution lengths across paraphrases",
+    client=px_client,
+    timeout=600,
+    retries=0,
 )
-experiment.as_dataframe()
+outputs = [
+    run["output"]
+    for run in experiment["task_runs"]
+    if not run.get("error") and isinstance(run.get("output"), dict)
+]
 
-outputs = experiment.as_dataframe()["output"].to_dict().values()
+experiment_df = pd.DataFrame(outputs)
 
-# Will include the user and system messages
-optimal_path_length = min(output.get('path_length') for output in outputs if output and output.get('path_length') is not None)
-print(f"The optimal path length is {optimal_path_length}")
+valid_lengths = [
+    output["path_length"] for output in outputs if output.get("path_length", 0) > 0
+]
+
+if not valid_lengths:
+    raise RuntimeError("No completed runs with valid path lengths.")
+
+baseline_path_length = min(valid_lengths)
+
+print(f"Shortest observed path: {baseline_path_length}")
+
+
 @create_evaluator(name="Convergence Eval", kind="CODE")
-def evaluate_path_length(output: str) -> float:
-    if output and output.get("path_length"):
-        return optimal_path_length/float(output.get("path_length"))
-    else:
-        return 0
+def evaluate_path_length(output: dict) -> float:
+    if not isinstance(output, dict):
+        return 0.0
 
-experiment = evaluate_experiment(experiment,
-                            evaluators=[evaluate_path_length])
+    path_length = output.get("path_length", 0)
+
+    if path_length <= 0:
+        return 0.0
+
+    return baseline_path_length / float(path_length)
+
+
+experiment = evaluate_experiment(
+    experiment=experiment,
+    evaluators=[evaluate_path_length],
+    client=px_client,
+)
